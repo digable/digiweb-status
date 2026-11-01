@@ -1,0 +1,10 @@
+# Hourly, so a machine that stops reporting turns red on the page even when nothing else happens.
+[Unit]
+Description=digiweb status page build (hourly)
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

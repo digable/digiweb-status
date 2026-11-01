@@ -1,0 +1,14 @@
+{
+  "_comment": "Copy to /etc/digiweb-status/report.json and edit for this machine. Below: a machine that sends its report to the status server. For the status server itself, see report.server.example.json.",
+  "machine": "desktop",
+  "jobs": [
+    { "label": "OS update", "timer": "my-system-update.timer", "service": "my-system-update.service" }
+  ],
+  "services": [],
+  "send": {
+    "host": "192.0.2.10",
+    "user": "status",
+    "key": "/etc/digiweb-status/id_ed25519",
+    "known_hosts": "/etc/digiweb-status/known_hosts"
+  }
+}

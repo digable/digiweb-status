@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy to /etc/digiweb-status/site.json on the status server and edit. Lists the machines, in the order their cards appear.",
+  "machines": [
+    { "name": "server",  "label": "the status server", "address": "192.0.2.10" },
+    { "name": "desktop", "address": "192.0.2.20" },
+    { "name": "pi" }
+  ],
+  "timezone": "America/Chicago",
+  "stale_hours": 48,
+  "backup_max_age_days": 8,
+  "disk_warn_percent": 85,
+  "watch": [
+    { "item": "CVE-2026-98432 (Linux TCP)", "machines": {
+        "server":  { "field": "kernel_upstream", "at_least": "6.1.190" },
+        "desktop": { "field": "kernel",          "at_least": "7.0.0-43" },
+        "pi":      { "field": "kernel",          "at_least": "6.18.56" } } }
+  ],
+  "reports_dir": "/var/lib/digiweb-status/reports",
+  "output": "/var/www/digiweb-status/index.html"
+}

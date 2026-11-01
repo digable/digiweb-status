@@ -1,0 +1,31 @@
+# nginx site for the status page on the status server. Copy to /etc/nginx/sites-available/digiweb-status,
+# put in your home network and your own Tailscale devices (`tailscale status` lists them), and link
+# it into sites-enabled. See README, "Setting up the status server".
+#
+# Its own port (8090): your router doesn't forward it and it isn't one of your public site names, so it can
+# never be reached from the internet or through Cloudflare. ufw only opens it to the home network
+# and Tailscale; the allow list below narrows Tailscale to your own devices (GitHub's deploy jobs
+# join the tailnet too), and the login covers everyone else on the home Wi-Fi.
+server {
+    listen 8090;
+    server_name _;
+
+    root /var/www/digiweb-status;
+    index index.html;
+    expires -1;
+
+    # Your home network (behind a second router, every Wi-Fi device shows up as that router's address)
+    allow 192.168.1.0/24;      # <- your home network
+    # Your own devices on Tailscale: list them one by one, so CI runners on the tailnet stay out
+    allow 100.64.0.1;          # <- your PC
+    # allow 100.64.0.2;        # <- your phone
+    deny all;
+
+    auth_basic "digiweb status";
+    auth_basic_user_file /etc/digiweb-status/htpasswd;
+
+    location / {
+        limit_req zone=perip burst=20 nodelay;
+        try_files $uri $uri/ =404;
+    }
+}

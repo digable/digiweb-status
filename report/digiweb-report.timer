@@ -1,0 +1,13 @@
+# Every morning at 6:00 Central (after the Sunday jobs finish), and 10 minutes after each boot,
+# so a reboot from an update shows up the same morning.
+[Unit]
+Description=digiweb status report (daily and after boot)
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 America/Chicago
+OnBootSec=10min
+Persistent=true
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target

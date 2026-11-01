@@ -1,0 +1,11 @@
+# Settings, keys and the page login live in /etc/digiweb-status on each machine, never here
+site.json
+report.json
+*.local.json
+htpasswd
+id_ed25519*
+known_hosts
+# Generated
+*.pyc
+__pycache__/
+/www/

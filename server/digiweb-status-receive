@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""digiweb-status-receive NAME: file one machine's report and rebuild the status page.
+
+Runs on the status server as the `status` user. Each machine's SSH key in ~status/.ssh/authorized_keys is
+forced to run this with that machine's name, so the name always comes from the key, never from
+the report. The status server's own reporter runs it directly (runuser -u status).
+
+Reads the report (JSON, at most 256 KB) from stdin, checks it, writes
+/var/lib/digiweb-status/reports/NAME.json and runs digiweb-status-build.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+SITE = os.environ.get("DIGIWEB_STATUS_SITE", "/etc/digiweb-status/site.json")
+MAX_BYTES = 256 * 1024
+
+
+def fail(msg):
+    sys.exit("digiweb-status-receive: " + msg)
+
+
+def main():
+    if len(sys.argv) != 2 or not re.fullmatch(r"[a-z0-9-]{1,32}", sys.argv[1]):
+        fail("usage: digiweb-status-receive NAME")
+    name = sys.argv[1]
+    with open(SITE, encoding="utf-8") as f:
+        site = json.load(f)
+    if name not in [m["name"] for m in site["machines"]]:
+        fail("unknown machine " + name)
+
+    raw = sys.stdin.buffer.read(MAX_BYTES + 1)
+    if len(raw) > MAX_BYTES:
+        fail("report too large")
+    try:
+        report = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        fail("report isn't JSON")
+    if not isinstance(report, dict) or report.get("version") != 1:
+        fail("unexpected report format")
+
+    report["machine"] = name                 # the key decides who this is
+    report["received_at"] = int(time.time())
+
+    folder = site.get("reports_dir", "/var/lib/digiweb-status/reports")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, name + ".json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(report, f)
+    os.replace(tmp, path)
+
+    build = site.get("builder", "/usr/local/bin/digiweb-status-build")
+    code = subprocess.run([build], env=dict(os.environ, DIGIWEB_STATUS_SITE=SITE)).returncode
+    print("received %s report%s" % (name, "" if code == 0 else " (page build failed)"))
+
+
+if __name__ == "__main__":
+    main()

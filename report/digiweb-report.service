@@ -1,0 +1,13 @@
+# Gathers this machine's status and sends it to the status page on the status server (see README).
+[Unit]
+Description=digiweb status report
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/digiweb-report
+# Read-only look at the system; it only writes to the SSH connection (or, on the status server, the receiver)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only

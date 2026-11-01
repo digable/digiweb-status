@@ -1,0 +1,11 @@
+{
+  "_comment": "The status server's own report.json: it hands its report straight to the receiver (send.local) and can list services to watch and a backup folder.",
+  "machine": "server",
+  "jobs": [
+    { "label": "OS update", "timer": "my-system-update.timer", "service": "my-system-update.service" },
+    { "label": "Backup",    "timer": "my-backup.timer",        "service": "my-backup.service" }
+  ],
+  "services": ["nginx", "ssh"],
+  "backups": { "dir": "/var/backups/mine", "pattern": "*.tar.gz", "keep": 8 },
+  "send": { "local": true }
+}

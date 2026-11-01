@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""digiweb-status-build: turn the machines' reports into the status page.
+
+Runs on the status server as the `status` user: after every report (from digiweb-status-receive) and every
+hour (digiweb-status-build.timer), so a machine that stops reporting turns red even if nothing
+else happens. Writes one static HTML file; nginx serves it. Python 3 standard library only.
+
+Settings: /etc/digiweb-status/site.json (see site.example.json).
+"""
+import html
+import json
+import os
+import re
+import time
+from datetime import datetime
+
+SITE = os.environ.get("DIGIWEB_STATUS_SITE", "/etc/digiweb-status/site.json")
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:            # very old Python: show the server's local time
+    ZoneInfo = None
+
+e = html.escape
+
+
+# ---- formatting -------------------------------------------------------------------------------
+
+def tz(site):
+    if ZoneInfo:
+        try:
+            return ZoneInfo(site.get("timezone", "America/Chicago"))
+        except Exception:
+            pass
+    return None
+
+
+def when(ts, zone, date_only=False):
+    if not ts:
+        return "never"
+    d = datetime.fromtimestamp(ts, zone)
+    s = d.strftime("%a %b ") + str(d.day)
+    if not date_only:
+        s += ", " + d.strftime("%I:%M %p").lstrip("0")
+    return s
+
+
+def ago(ts, now):
+    if not ts:
+        return "never"
+    s = max(0, now - ts)
+    if s < 120:
+        return "just now"
+    if s < 7200:
+        return "%d min ago" % (s // 60)
+    if s < 172800:
+        return "%d h ago" % (s // 3600)
+    return "%d days ago" % (s // 86400)
+
+
+def span(seconds):
+    d = seconds // 86400
+    if d >= 2:
+        return "%d days" % d
+    h = seconds // 3600
+    return "%d h" % h if h else "%d min" % (seconds // 60)
+
+
+def size(n):
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if n < 1024 or unit == "TB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit)).replace(".0 ", " ")
+        n /= 1024.0
+
+
+def vparts(s):
+    return [int(x) for x in re.findall(r"\d+", s or "")]
+
+
+def at_least(have, want):
+    w = vparts(want)
+    return vparts(have)[:len(w)] >= w
+
+
+# ---- judging a machine ----------------------------------------------------------------------
+
+def judge(m, r, site, now):
+    """Returns (state, issues): state is ok, watch or down; issues are short sentences."""
+    issues = []
+    if not r:
+        return "down", ["%s has never reported." % m["name"]]
+    if now - r.get("received_at", 0) > site.get("stale_hours", 48) * 3600:
+        return "down", ["%s: last report %s" % (m["name"], ago(r.get("received_at"), now))]
+
+    if r.get("updates_waiting"):
+        issues.append("%d updates waiting" % r["updates_waiting"])
+    if r.get("reboot_required"):
+        issues.append("needs a reboot")
+    if r.get("failed_units"):
+        issues.append("failed: " + ", ".join(r["failed_units"]))
+    for name, state in (r.get("services") or {}).items():
+        if state != "active":
+            issues.append("%s is %s" % (name, state))
+    for j in r.get("jobs") or []:
+        if j.get("result") not in (None, "success"):
+            issues.append("%s ended with %s" % (j["label"], j["result"]))
+    d = r.get("disk")
+    if d and d["total"] and d["used"] / d["total"] * 100 >= site.get("disk_warn_percent", 85):
+        issues.append("disk %d%% full" % (d["used"] / d["total"] * 100))
+    b = r.get("backups")
+    if b is not None:
+        newest = b["files"][0]["time"] if b["files"] else 0
+        if now - newest > site.get("backup_max_age_days", 8) * 86400:
+            issues.append("no backup since " + (ago(newest, now) if newest else "ever"))
+    for w in site.get("watch", []):
+        rule = w.get("machines", {}).get(m["name"])
+        if rule and not at_least(r.get(rule.get("field", "kernel")), rule["at_least"]):
+            issues.append("%s: needs %s" % (w["item"], rule["at_least"]))
+    return ("watch" if issues else "ok"), issues
+
+
+# ---- the page --------------------------------------------------------------------------------
+
+CSS = """
+:root { --card: rgb(8 30 80 / 0.55); --line: rgb(255 255 255 / 0.14); --dim: rgb(255 255 255 / 0.66);
+  --faint: rgb(255 255 255 / 0.42); --accent: #5ec8ff; --ok: #5be38f; --warn: #ffcc4d; --bad: #ff6b6b; }
+* { box-sizing: border-box; }
+html { min-height: 100%; background: linear-gradient(160deg, #0a2a66, #1554c7); }
+body { margin: 0; color: #fff; font: 15px/1.45 Inter, system-ui, sans-serif; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 32px 16px 48px; }
+header { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 20px; }
+h1 { font: 700 2.4rem/1 "Space Grotesk", sans-serif; letter-spacing: -0.03em; margin: 0; }
+h1 span { color: var(--accent); }
+.sub { color: var(--dim); margin-top: 6px; }
+.pixel { font-family: "Press Start 2P", monospace; font-size: 0.62rem; }
+.stamp { color: var(--faint); text-align: right; }
+.stamp b { color: var(--dim); font-weight: 600; }
+.banner { display: flex; gap: 12px; align-items: flex-start; border: 1px solid rgb(255 204 77 / 0.55);
+  background: rgb(255 204 77 / 0.10); border-radius: 10px; padding: 12px 14px; margin-bottom: 22px; }
+.banner.bad { border-color: rgb(255 107 107 / 0.6); background: rgb(255 107 107 / 0.12); }
+.banner .pixel { color: var(--warn); white-space: nowrap; padding-top: 3px; }
+.banner.bad .pixel { color: var(--bad); }
+.banner ul { margin: 0; padding-left: 18px; }
+.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+@media (max-width: 600px) { .stamp { text-align: left; } h1 { font-size: 2rem; } }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+.card-head { display: flex; justify-content: space-between; align-items: start; gap: 8px; margin-bottom: 4px; }
+.name { font: 700 1.35rem "Space Grotesk", sans-serif; letter-spacing: -0.02em; }
+.os { color: var(--faint); font-size: 0.85rem; }
+.badge { border-radius: 4px; padding: 5px 7px 4px; line-height: 1; white-space: nowrap; }
+.badge.ok { color: var(--ok); border: 1px solid rgb(91 227 143 / 0.6); }
+.badge.watch { color: var(--warn); border: 1px solid rgb(255 204 77 / 0.6); }
+.badge.down { color: var(--bad); border: 1px solid rgb(255 107 107 / 0.6); }
+.reported { color: var(--faint); font-size: 0.8rem; margin-bottom: 12px; }
+.rows { display: grid; grid-template-columns: auto 1fr; gap: 7px 14px; margin: 0; }
+.rows dt { color: var(--dim); font-size: 0.86rem; }
+.rows dd { margin: 0; text-align: right; font-size: 0.9rem; }
+.rows dd small { display: block; color: var(--faint); font-size: 0.78rem; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+.dot.none { background: var(--faint); }
+.sep { grid-column: 1 / -1; border-top: 1px solid var(--line); margin: 4px 0; }
+.bar { height: 6px; border-radius: 3px; background: rgb(255 255 255 / 0.15); margin-top: 4px; overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--accent); }
+.services { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.svc { font-size: 0.78rem; border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px 2px 7px; color: var(--dim); }
+h2 { font: 700 1.1rem "Space Grotesk", sans-serif; margin: 30px 0 10px; }
+table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); font-size: 0.88rem; }
+th { color: var(--faint); font-weight: 600; font-size: 0.78rem; }
+tr:last-child td { border-bottom: 0; }
+td.muted { color: var(--dim); }
+.tablewrap { overflow-x: auto; }
+footer { margin-top: 28px; color: var(--faint); font-size: 0.82rem; }
+"""
+
+
+def dot(kind):
+    return '<span class="dot %s"></span>' % kind
+
+
+def row(label, value, note="", kind=None, bar=None):
+    v = (dot(kind) if kind else "") + value
+    if bar is not None:
+        v += '<div class="bar"><i style="width:%d%%"></i></div>' % max(0, min(100, bar))
+    if note:
+        v += "<small>%s</small>" % note
+    return "<dt>%s</dt><dd>%s</dd>" % (e(label), v)
+
+
+def card(m, r, state, issues, site, zone, now):
+    head = ('<div class="card-head"><div><div class="name">%s</div><div class="os">%s</div></div>'
+            '<span class="badge %s pixel">%s</span></div>') % (
+        e(m["name"]), e(" · ".join(x for x in [m.get("label"), r.get("os") if r else None,
+                                                     "(%s)" % r["arch"] if r and r.get("arch") else None,
+                                                     m.get("address")] if x)),
+        state, {"ok": "ok", "watch": "watch", "down": "down"}[state])
+    if not r:
+        return '<section class="card">%s<div class="reported">no report yet</div></section>' % head
+
+    rows = []
+    up = r.get("last_upgrade")
+    if up:
+        t = up.get("start_ts")         # the reporting machine converted its own local time
+        note = "%d upgraded" % up["upgraded"] + (", %d new" % up["installed"] if up["installed"] else "")
+        rows.append(row("Last update", e(when(t, zone)), e(note), "bad" if up.get("error") else "ok"))
+    else:
+        rows.append(row("Last update", "none recorded"))
+    waiting = r.get("updates_waiting")
+    rows.append(row("Updates waiting", "?" if waiting is None else str(waiting), kind="warn" if waiting else None))
+
+    kernel_note, kernel_kind = "", None
+    for w in site.get("watch", []):
+        rule = w.get("machines", {}).get(m["name"])
+        if rule:
+            ok = at_least(r.get(rule.get("field", "kernel")), rule["at_least"])
+            kernel_note = "%s %s" % (e(w["item"].split(" (")[0]), "fixed" if ok else "fix pending (" + e(rule["at_least"]) + ")")
+            kernel_kind = None if ok else "warn"
+    kv = r.get("kernel", "?")
+    if r.get("kernel_upstream") and r["kernel_upstream"] not in kv:
+        kv += " (%s)" % r["kernel_upstream"]
+    rows.append(row("Kernel", e(kv), kernel_note, kernel_kind))
+    rows.append(row("Reboot pending", "yes" if r.get("reboot_required") else "no", kind="warn" if r.get("reboot_required") else None))
+    if r.get("booted_at"):
+        rows.append(row("Up since", e(when(r["booted_at"], zone)), e(span(now - r["booted_at"]))))
+
+    b = r.get("backups")
+    extra = []
+    if b is not None:
+        if b["files"]:
+            f = b["files"][0]
+            kept = "%d kept" % len(b["files"]) + (" of %s" % b["keep"] if b.get("keep") else "")
+            old = now - f["time"] > site.get("backup_max_age_days", 8) * 86400
+            extra.append(row("Last backup", e(when(f["time"], zone)), e("%s · %s" % (size(f["size"]), kept)), "warn" if old else "ok"))
+        else:
+            extra.append(row("Last backup", "none", kind="warn"))
+    d = r.get("disk")
+    if d and d["total"]:
+        pct = d["used"] / d["total"] * 100
+        extra.append(row("Disk", "%d%% of %s" % (pct, size(d["total"])), bar=pct,
+                         kind="warn" if pct >= site.get("disk_warn_percent", 85) else None))
+    mem = r.get("memory")
+    if mem and mem["total"]:
+        pct = mem["used"] / mem["total"] * 100
+        extra.append(row("Memory", "%d%% of %s" % (pct, size(mem["total"])), bar=pct))
+    if r.get("temperature") is not None:
+        extra.append(row("Temperature", "%s &deg;C" % e(str(r["temperature"]))))
+    if r.get("failed_units"):
+        extra.append(row("Failed", e(", ".join(r["failed_units"])), kind="bad"))
+
+    svc = ""
+    if r.get("services"):
+        svc = '<div class="services">' + "".join(
+            '<span class="svc">%s%s</span>' % (dot("ok" if s == "active" else "bad"), e(n))
+            for n, s in r["services"].items()) + "</div>"
+
+    body = "".join(rows) + ('<div class="sep"></div>' + "".join(extra) if extra else "")
+    return '<section class="card">%s<div class="reported">reported %s</div><dl class="rows">%s</dl>%s</section>' % (
+        head, e(ago(r.get("received_at"), now)), body, svc)
+
+
+def page(site, reports, now):
+    zone = tz(site)
+    cards, problems, jobs, watch_rows, backup_rows = [], [], [], [], []
+    worst = "ok"
+    for m in site["machines"]:
+        r = reports.get(m["name"])
+        state, issues = judge(m, r, site, now)
+        if state == "down" or (state == "watch" and worst == "ok"):
+            worst = state
+        for i in issues:
+            problems.append((state, e(i) if state == "down" else "<b>%s</b>: %s" % (e(m["name"]), e(i))))
+        cards.append(card(m, r, state, issues, site, zone, now))
+        for j in (r or {}).get("jobs") or []:
+            res = j.get("result")
+            # a service's result isn't kept across a reboot: that's not a problem, just unknown
+            kind = "ok" if res == "success" else ("bad" if res else "none")
+            text = "ok" if res == "success" else (res or ("running" if j.get("running") else
+                                                           "ran; result not kept after a reboot" if j.get("last_run") else "hasn't run yet"))
+            jobs.append((j.get("next_run") or 0, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s%s</td><td class=\"muted\">%s</td></tr>" % (
+                e(j["label"]), e(m["name"]), e(when(j.get("last_run"), zone)), dot(kind), e(text),
+                e(when(j.get("next_run"), zone)))))
+        for f in ((r or {}).get("backups") or {}).get("files", []):
+            backup_rows.append("<tr><td>%s</td><td>%s</td><td>%s</td><td class=\"muted\">%s</td></tr>" % (
+                e(f["name"]), e(m["name"]), e(size(f["size"])), e(when(f["time"], zone))))
+
+    for w in site.get("watch", []):
+        cells = []
+        for m in site["machines"]:
+            rule = w.get("machines", {}).get(m["name"])
+            r = reports.get(m["name"])
+            if not rule:
+                cells.append('<td class="muted">-</td>')
+            elif not r:
+                cells.append('<td class="muted">no report</td>')
+            elif at_least(r.get(rule.get("field", "kernel")), rule["at_least"]):
+                cells.append("<td>%sfixed</td>" % dot("ok"))
+            else:
+                cells.append("<td>%sneeds %s</td>" % (dot("warn"), e(rule["at_least"])))
+        watch_rows.append("<tr><td>%s</td>%s</tr>" % (e(w["item"]), "".join(cells)))
+
+    banner = ""
+    if problems:
+        bad = any(s == "down" for s, _ in problems)
+        banner = '<div class="banner%s"><span class="pixel">%d to %s</span><ul>%s</ul></div>' % (
+            " bad" if bad else "", len(problems), "fix" if bad else "watch",
+            "".join("<li>%s</li>" % p for _, p in problems))
+    else:
+        banner = '<div class="banner" style="border-color:rgb(91 227 143 / .5);background:rgb(91 227 143 / .08)"><span class="pixel" style="color:var(--ok)">all good</span><p style="margin:0">Every machine reported, is up to date and has nothing pending.</p></div>'
+
+    jobs.sort(key=lambda x: x[0])
+    sections = ""
+    if jobs:
+        sections += ('<h2>Scheduled jobs</h2><div class="tablewrap"><table><tr><th>job</th><th>machine</th>'
+                     '<th>last run</th><th>result</th><th>next run</th></tr>%s</table></div>') % "".join(j for _, j in jobs)
+    if backup_rows:
+        sections += ('<h2>Backups</h2><div class="tablewrap"><table><tr><th>file</th><th>machine</th><th>size</th>'
+                     '<th>made</th></tr>%s</table></div>') % "".join(backup_rows)
+    if watch_rows:
+        sections += ('<h2>Watch list</h2><div class="tablewrap"><table><tr><th>item</th>%s</tr>%s</table></div>') % (
+            "".join("<th>%s</th>" % e(m["name"]) for m in site["machines"]), "".join(watch_rows))
+
+    title = {"ok": "all good", "watch": "watch", "down": "DOWN"}[worst]
+    return """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="300">
+<title>digiweb status: %s</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Press+Start+2P&family=Space+Grotesk:wght@500;700&display=swap">
+<style>%s</style></head><body><div class="wrap">
+<header><div><h1>digiweb<span>.</span>status</h1><div class="sub">your machines: updates, kernels, backups and services</div></div>
+<div class="stamp">page built <b>%s</b><br>refreshes every 5 minutes</div></header>
+%s<div class="grid">%s</div>%s
+<footer>Private: only reachable from your home network and Tailscale, with a login. Machines report every morning and a
+few minutes after a reboot; one that hasn't reported in %d hours turns red.</footer>
+</div></body></html>
+""" % (title, CSS, e(when(now, zone)), banner, "".join(cards), sections, site.get("stale_hours", 48))
+
+
+def main():
+    with open(SITE, encoding="utf-8") as f:
+        site = json.load(f)
+    folder = site.get("reports_dir", "/var/lib/digiweb-status/reports")
+    reports = {}
+    for m in site["machines"]:
+        try:
+            with open(os.path.join(folder, m["name"] + ".json"), encoding="utf-8") as f:
+                reports[m["name"]] = json.load(f)
+        except (OSError, ValueError):
+            pass
+    out = site.get("output", "/var/www/digiweb-status/index.html")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    tmp = out + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(page(site, reports, int(time.time())))
+    os.replace(tmp, out)
+
+
+if __name__ == "__main__":
+    main()

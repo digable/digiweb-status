@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""digiweb-report: gather this machine's status and send it to the status page on the status server.
+
+Runs as root from digiweb-report.timer (every morning and a few minutes after boot). Reads only:
+os-release, uname, /proc, the apt log, `apt-get -s`, systemctl and the backup folder (if any).
+It never reads secrets, and the report holds none.
+
+    digiweb-report            gather and send
+    digiweb-report --print    gather and print the report (nothing is sent)
+
+Settings: /etc/digiweb-status/report.json (see report.example.json). Python 3 standard library only.
+"""
+import glob
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+CONFIG = os.environ.get("DIGIWEB_REPORT_CONFIG", "/etc/digiweb-status/report.json")
+REPORT_VERSION = 1
+
+
+def run(cmd, timeout=60, stdin=None):
+    """Runs a command; returns (exit code, stdout). Never raises."""
+    try:
+        p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return -1, ""
+
+
+def read(path, default=""):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+# ---- the system ---------------------------------------------------------------------------------
+
+def os_name():
+    m = re.search(r'^PRETTY_NAME="?([^"\n]*)"?', read("/etc/os-release"), re.M)
+    return m.group(1) if m else platform.system()
+
+
+def kernel_upstream():
+    """The upstream kernel version. Debian's `uname -r` (6.1.0-54) hides it; `uname -v` has it."""
+    m = re.search(r"Debian (\d+\.\d+\.\d+)", platform.version())
+    if m:
+        return m.group(1)
+    m = re.match(r"(\d+\.\d+\.\d+)", platform.release())
+    return m.group(1) if m else platform.release()
+
+
+def boot_time():
+    try:
+        return round(time.time() - float(read("/proc/uptime").split()[0]))
+    except (ValueError, IndexError):
+        return None
+
+
+def newer_kernel_installed(booted):
+    """True if a kernel other than the running one was installed after boot: a reboot is needed
+    even where the system doesn't flag it (Raspberry Pi OS doesn't always)."""
+    running = platform.release()
+    for d in glob.glob("/lib/modules/*"):
+        name = os.path.basename(d)
+        try:
+            if name != running and booted and os.path.getmtime(d) > booted:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def updates_waiting():
+    """Packages a full upgrade would install now (from the package lists apt last downloaded)."""
+    code, out = run(["apt-get", "-s", "-o", "Debug::NoLocking=1", "dist-upgrade"], timeout=120)
+    if code != 0:
+        return None
+    return sum(1 for line in out.splitlines() if line.startswith("Inst "))
+
+
+def last_apt_upgrade():
+    """The most recent upgrade in apt's history: when, the command, packages upgraded/installed."""
+    text = read("/var/log/apt/history.log")
+    last = None
+    for block in text.split("\n\n"):
+        fields = {}
+        for line in block.strip().splitlines():
+            key, _, value = line.partition(": ")
+            fields[key] = value
+        if "upgrade" in fields.get("Commandline", ""):
+            last = fields
+    if not last:
+        return None
+
+    def count(value):
+        return len(re.findall(r"\),?", value)) if value else 0
+
+    start = last.get("Start-Date", "").replace("  ", " ")
+    try:    # apt logs this machine's local time; send a timestamp so the status server needn't guess the zone
+        start_ts = int(time.mktime(time.strptime(start, "%Y-%m-%d %H:%M:%S")))
+    except ValueError:
+        start_ts = None
+    return {
+        "start": start,
+        "start_ts": start_ts,
+        "end": last.get("End-Date", "").replace("  ", " "),
+        "command": last.get("Commandline", ""),
+        "upgraded": count(last.get("Upgrade")),
+        "installed": count(last.get("Install")),
+        "error": bool(last.get("Error")),
+    }
+
+
+def systemd_props(unit, props):
+    code, out = run(["systemctl", "show", unit, "--timestamp=unix", "-p", ",".join(props)])
+    values = {}
+    for line in out.splitlines():
+        key, _, value = line.partition("=")
+        values[key] = value
+    return values
+
+
+def unix_or_none(value):
+    m = re.match(r"@(\d+)", value or "")
+    return int(m.group(1)) if m else None
+
+
+def job_status(job):
+    """A scheduled job: when its timer last fired and fires next, and how its service ended.
+    A service's result is forgotten after a reboot; the timer's last run is not (Persistent=true)."""
+    t = systemd_props(job["timer"], ["LastTriggerUSec", "NextElapseUSecRealtime"])
+    s = systemd_props(job["service"], ["Result", "ExecMainStatus", "ExecMainExitTimestamp", "ActiveState"])
+    ended = unix_or_none(s.get("ExecMainExitTimestamp"))
+    return {
+        "label": job.get("label", job["service"]),
+        "last_run": unix_or_none(t.get("LastTriggerUSec")),
+        "next_run": unix_or_none(t.get("NextElapseUSecRealtime")),
+        "ended": ended,
+        "result": s.get("Result") if ended else None,      # None: unknown (not run since boot)
+        "exit_status": s.get("ExecMainStatus") if ended else None,
+        "running": s.get("ActiveState") == "activating",
+    }
+
+
+def services(names):
+    out = {}
+    for name in names:
+        code, state = run(["systemctl", "is-active", name])
+        out[name] = state.strip() or "unknown"
+    return out
+
+
+def failed_units():
+    code, out = run(["systemctl", "list-units", "--state=failed", "--no-legend", "--plain"])
+    return [line.split()[0] for line in out.splitlines() if line.strip()]
+
+
+def disk():
+    u = shutil.disk_usage("/")
+    return {"total": u.total, "used": u.used}
+
+
+def memory():
+    info = {}
+    for line in read("/proc/meminfo").splitlines():
+        key, _, value = line.partition(":")
+        if value.strip().endswith("kB"):
+            info[key] = int(value.split()[0]) * 1024
+    if "MemTotal" not in info:
+        return None
+    return {"total": info["MemTotal"], "used": info["MemTotal"] - info.get("MemAvailable", 0)}
+
+
+def temperature():
+    temps = []
+    for path in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+        try:
+            temps.append(int(read(path).strip()) / 1000)
+        except ValueError:
+            pass
+    return round(max(temps), 1) if temps else None
+
+
+def backups(cfg):
+    if not cfg:
+        return None
+    files = []
+    for path in glob.glob(os.path.join(cfg["dir"], cfg.get("pattern", "*.tar.gz"))):
+        try:
+            st = os.stat(path)
+            files.append({"name": os.path.basename(path), "size": st.st_size, "time": int(st.st_mtime)})
+        except OSError:
+            pass
+    files.sort(key=lambda f: f["time"], reverse=True)
+    return {"keep": cfg.get("keep"), "files": files}
+
+
+# ---- the report -------------------------------------------------------------------------------
+
+def gather(cfg):
+    booted = boot_time()
+    return {
+        "version": REPORT_VERSION,
+        "machine": cfg["machine"],
+        "reported_at": int(time.time()),
+        "os": os_name(),
+        "arch": platform.machine(),
+        "kernel": platform.release(),
+        "kernel_upstream": kernel_upstream(),
+        "booted_at": booted,
+        "reboot_required": os.path.exists("/var/run/reboot-required") or newer_kernel_installed(booted),
+        "updates_waiting": updates_waiting(),
+        "last_upgrade": last_apt_upgrade(),
+        "jobs": [job_status(j) for j in cfg.get("jobs", [])],
+        "services": services(cfg.get("services", [])),
+        "failed_units": failed_units(),
+        "disk": disk(),
+        "memory": memory(),
+        "temperature": temperature(),
+        "backups": backups(cfg.get("backups")),
+    }
+
+
+def send(cfg, report):
+    """Hands the report to the status server. Over SSH the key can only run the receiver, and the receiver
+    files it under the machine name tied to that key, so one machine can't pose as another."""
+    data = json.dumps(report)
+    s = cfg["send"]
+    if s.get("local"):
+        cmd = ["runuser", "-u", s.get("user", "status"), "--", "/usr/local/bin/digiweb-status-receive", cfg["machine"]]
+    else:
+        cmd = ["ssh", "-i", s["key"], "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+               "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + s["known_hosts"],
+               "%s@%s" % (s.get("user", "status"), s["host"])]
+    code, out = run(cmd, timeout=90, stdin=data)
+    if code != 0:
+        sys.exit("digiweb-report: sending failed (exit %s)" % code)
+    print(out.strip() or "sent")
+
+
+def main():
+    with open(CONFIG, encoding="utf-8") as f:
+        cfg = json.load(f)
+    report = gather(cfg)
+    if "--print" in sys.argv[1:]:
+        print(json.dumps(report, indent=2))
+        return
+    send(cfg, report)
+
+
+if __name__ == "__main__":
+    main()
