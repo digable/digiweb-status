@@ -129,8 +129,17 @@ def systemd_props(unit, props):
 
 
 def unix_or_none(value):
-    m = re.match(r"@(\d+)", value or "")
-    return int(m.group(1)) if m else None
+    """A systemd time as seconds. Newer systemd honors --timestamp=unix ("@1793527254"); systemd 252
+    (Debian 12) still prints timer times as dates ("Sun 2026-11-01 04:00:54 CST"), which GNU date
+    reads, zone abbreviation included. Empty or "n/a" means never."""
+    value = (value or "").strip()
+    m = re.match(r"@(\d+)", value)
+    if m:
+        return int(m.group(1))
+    if not value or value == "n/a" or value == "0":
+        return None
+    code, out = run(["date", "-d", value, "+%s"], timeout=10)
+    return int(out.strip()) if code == 0 and out.strip().isdigit() else None
 
 
 def job_status(job):
