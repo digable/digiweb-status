@@ -78,12 +78,18 @@ def newer_kernel_installed(booted):
     return False
 
 
-def updates_waiting():
-    """Packages a full upgrade would install now (from the package lists apt last downloaded)."""
+def upgradable():
+    """Names of the packages a full upgrade would install now (from the package lists apt last
+    downloaded), or None if apt can't say."""
     code, out = run(["apt-get", "-s", "-o", "Debug::NoLocking=1", "dist-upgrade"], timeout=120)
     if code != 0:
         return None
-    return sum(1 for line in out.splitlines() if line.startswith("Inst "))
+    return {line.split()[1].split(":")[0] for line in out.splitlines() if line.startswith("Inst ")}
+
+
+def updates_waiting():
+    names = upgradable()
+    return None if names is None else len(names)
 
 
 def last_apt_upgrade():
@@ -269,8 +275,11 @@ def security_debsecan():
         ids_by_pkg.setdefault(cve, set()).add(pkg)
         if pkg not in NOISE_PACKAGES and ("high urgency" in notes or "remotely exploitable" in notes):
             urgent.append({"cve": cve, "pkg": pkg, "notes": notes})
+    # debsecan's --only-fixed means "fixed somewhere in Debian" (unstable counts), so a fix is only
+    # waiting when apt can actually install a newer version of that package here
     code, fixed = run(["debsecan", "--suite", suite, "--format", "packages", "--only-fixed"], timeout=300)
-    fixes = sorted(set(fixed.split())) if code == 0 else []
+    can_install = upgradable() or set()
+    fixes = sorted(set(fixed.split()) & can_install) if code == 0 else []
     # "new" leaves out CVEs that only touch the kernel headers (a handful every day, never run)
     counted = {c: p for c, p in ids_by_pkg.items() if p - NOISE_PACKAGES}
     new = new_since_last(counted)
