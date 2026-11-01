@@ -3,14 +3,25 @@
 #
 #   sudo ./install.sh report     every machine: the reporter and its daily timer
 #   sudo ./install.sh server     the status server only: the receiver, page builder and its hourly timer
+#   sudo ./install.sh update     pull the latest from GitHub and reinstall what this machine has
 #
-# Never touches /etc/digiweb-status (your settings, keys and the page login). Run it again after
-# `git pull` to update.
+# Never touches /etc/digiweb-status (your settings, keys and the page login).
 set -euo pipefail
+
+# Everything is inside main(), so bash has read the whole file before running any of it: `update`
+# replaces this file with git pull while it runs.
+main() {
 cd "$(dirname "$0")"
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 
 case "${1:-}" in
+update)
+    git pull --ff-only -q
+    echo "now at $(git log -1 --format='%h %s (%cd)' --date=short)"
+    # Run the freshly pulled installer for each part this machine already has
+    if [ -x /usr/local/bin/digiweb-status-receive ]; then ./install.sh server; fi
+    if [ -x /usr/local/bin/digiweb-report ]; then ./install.sh report; fi
+    ;;
 report)
     install -m 755 report/digiweb-report /usr/local/bin/digiweb-report
     install -m 644 report/digiweb-report.service report/digiweb-report.timer /etc/systemd/system/
@@ -28,5 +39,9 @@ server)
     echo "server parts installed; settings go in /etc/digiweb-status/site.json"
     ;;
 *)
-    echo "usage: sudo ./install.sh report|server"; exit 1 ;;
+    echo "usage: sudo ./install.sh report|server|update"; exit 1 ;;
 esac
+}
+
+main "$@"
+exit

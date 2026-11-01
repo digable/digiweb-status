@@ -120,8 +120,16 @@ Back on the machine: `sudo systemctl start digiweb-report`. It prints `received 
 
 ## Updating
 
-`git pull` in the checkout, then `sudo ./install.sh report` (and `server` on the status server).
-Your settings in `/etc/digiweb-status` are never touched.
+After pushing a change, on each machine, in its checkout (`/srv/src/digiweb-status` or
+`/opt/digiweb-status`):
+
+```bash
+sudo ./install.sh update
+```
+
+It pulls the latest from GitHub and reinstalls whatever that machine has (the reporter
+everywhere, plus the receiver and page builder on the status server). Your settings in
+`/etc/digiweb-status` are never touched.
 
 ## Trying it
 
