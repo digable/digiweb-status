@@ -64,17 +64,24 @@ def boot_time():
         return None
 
 
-def newer_kernel_installed(booted):
-    """True if a kernel other than the running one was installed after boot: a reboot is needed
-    even where the system doesn't flag it (Raspberry Pi OS doesn't always)."""
-    running = platform.release()
+def kernel_key(name):
+    """Comparable version of a kernel name: 7.0.0-42-generic -> (7, 0, 0, 42), 6.18.50+rpt-rpi-v8 -> (6, 18, 50, 0)."""
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)(?:-(\d+))?", name)
+    return tuple(int(x or 0) for x in m.groups()) if m else None
+
+
+def newer_kernel_installed(booted=None):
+    """True if a kernel newer than the running one is installed: a reboot is needed even where the
+    system doesn't flag it (Raspberry Pi OS doesn't always). Older kernels kept as a fallback, and
+    other flavours of the same version (the Pi has two), don't count."""
+    running = kernel_key(platform.release())
+    if running is None:
+        return False
     for d in glob.glob("/lib/modules/*"):
-        name = os.path.basename(d)
-        try:
-            if name != running and booted and os.path.getmtime(d) > booted:
-                return True
-        except OSError:
-            pass
+        key = kernel_key(os.path.basename(d))
+        # modules.dep is only there while that kernel is installed (not in leftover folders)
+        if key and key > running and os.path.exists(os.path.join(d, "modules.dep")):
+            return True
     return False
 
 
