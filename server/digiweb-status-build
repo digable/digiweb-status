@@ -116,6 +116,16 @@ def judge(m, r, site, now):
         rule = w.get("machines", {}).get(m["name"])
         if rule and not at_least(r.get(rule.get("field", "kernel")), rule["at_least"]):
             issues.append("%s: needs %s" % (w["item"], rule["at_least"]))
+    sec = r.get("security")
+    if sec:
+        if sec.get("error"):
+            issues.append("security scan: " + sec["error"])
+        if sec.get("fixes_waiting"):
+            n = len(sec["fixes_waiting"])
+            issues.append("%d security fix%s waiting (%s)" % (n, "" if n == 1 else "es", ", ".join(sec["fixes_waiting"][:4])
+                                                             + (", ..." if len(sec["fixes_waiting"]) > 4 else "")))
+        if sec.get("urgent_count"):
+            issues.append("%d urgent security problem%s with no fix yet" % (sec["urgent_count"], "" if sec["urgent_count"] == 1 else "s"))
     return ("watch" if issues else "ok"), issues
 
 
@@ -171,6 +181,7 @@ th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--lin
 th { color: var(--faint); font-weight: 600; font-size: 0.78rem; }
 tr:last-child td { border-bottom: 0; }
 td.muted { color: var(--dim); }
+td a { color: var(--accent); }
 .tablewrap { overflow-x: auto; }
 footer { margin-top: 28px; color: var(--faint); font-size: 0.82rem; }
 """
@@ -221,6 +232,23 @@ def card(m, r, state, issues, site, zone, now):
     if r.get("kernel_upstream") and r["kernel_upstream"] not in kv:
         kv += " (%s)" % r["kernel_upstream"]
     rows.append(row("Kernel", e(kv), kernel_note, kernel_kind))
+    sec = r.get("security")
+    if sec:
+        if sec.get("error"):
+            rows.append(row("Security", "scan failed", e(sec["error"]), "warn"))
+        else:
+            waiting = len(sec.get("fixes_waiting") or [])
+            notes = []
+            if sec.get("urgent_count"):
+                notes.append("%d urgent open" % sec["urgent_count"])
+            if sec.get("new_count"):
+                notes.append("%d new" % sec["new_count"])
+            if sec.get("esm_only"):
+                notes.append("%d more with Ubuntu Pro" % len(sec["esm_only"]))
+            if sec.get("open_total") is not None and not notes:
+                notes.append("%d known, none urgent" % sec["open_total"])
+            rows.append(row("Security", "%d fix%s waiting" % (waiting, "" if waiting == 1 else "es"), e(" \u00b7 ".join(notes)),
+                            "warn" if waiting or sec.get("urgent_count") else "ok"))
     rows.append(row("Reboot pending", "yes" if r.get("reboot_required") else "no", kind="warn" if r.get("reboot_required") else None))
     if r.get("booted_at"):
         rows.append(row("Up since", e(when(r["booted_at"], zone)), e(span(now - r["booted_at"]))))
@@ -309,11 +337,37 @@ def page(site, reports, now):
     else:
         banner = '<div class="banner" style="border-color:rgb(91 227 143 / .5);background:rgb(91 227 143 / .08)"><span class="pixel" style="color:var(--ok)">all good</span><p style="margin:0">Every machine reported, is up to date and has nothing pending.</p></div>'
 
+    sec_rows = []
+    for m in site["machines"]:
+        sec = (reports.get(m["name"]) or {}).get("security")
+        if not sec or sec.get("error"):
+            continue
+        link = sec.get("link", "")
+        def cve(c):
+            return '<a href="%s%s" rel="noreferrer">%s</a>' % (e(link), e(c), e(c)) if link else e(c)
+        for pkg in sec.get("fixes_waiting") or []:
+            sec_rows.append("<tr><td>%s</td><td>%s</td><td>%sfix waiting</td><td class=\"muted\">next Sunday's update installs it</td></tr>" % (
+                e(m["name"]), e(pkg), dot("warn")))
+        for u in sec.get("urgent") or []:
+            sec_rows.append("<tr><td>%s</td><td>%s</td><td>%s%s</td><td class=\"muted\">%s, no fix yet</td></tr>" % (
+                e(m["name"]), e(u["pkg"]), dot("bad" if "high" in u["notes"] else "warn"), cve(u["cve"]), e(u["notes"])))
+        for n in sec.get("new") or []:
+            sec_rows.append("<tr><td>%s</td><td>%s</td><td>%s%s</td><td class=\"muted\">new since the last report</td></tr>" % (
+                e(m["name"]), e(", ".join(n["pkgs"])), dot("none"), cve(n["cve"])))
+        if sec.get("esm_only"):
+            sec_rows.append("<tr><td>%s</td><td>%s</td><td>%s%d with Ubuntu Pro</td><td class=\"muted\">fixes only available through Ubuntu Pro (free for personal use)</td></tr>" % (
+                e(m["name"]), e(", ".join(sec["esm_only"][:6]) + (", ..." if len(sec["esm_only"]) > 6 else "")), dot("none"), len(sec["esm_only"])))
+
     jobs.sort(key=lambda x: x[0])
     sections = ""
     if jobs:
         sections += ('<h2>Scheduled jobs</h2><div class="tablewrap"><table><tr><th>job</th><th>machine</th>'
                      '<th>last run</th><th>result</th><th>next run</th></tr>%s</table></div>') % "".join(j for _, j in jobs)
+    scanned = [m["name"] for m in site["machines"] if (reports.get(m["name"]) or {}).get("security")]
+    if scanned:
+        sections += ('<h2>Security</h2><div class="tablewrap"><table><tr><th>machine</th><th>package</th><th>issue</th>'
+                     '<th>note</th></tr>%s</table></div>') % ("".join(sec_rows) or
+                     '<tr><td colspan="4">%sNothing to act on: no fixes waiting, nothing urgent and nothing new on %s.</td></tr>' % (dot("ok"), e(", ".join(scanned))))
     if backup_rows:
         sections += ('<h2>Backups</h2><div class="tablewrap"><table><tr><th>file</th><th>machine</th><th>size</th>'
                      '<th>made</th></tr>%s</table></div>') % "".join(backup_rows)

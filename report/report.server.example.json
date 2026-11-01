@@ -6,6 +6,7 @@
     { "label": "Backup",    "timer": "my-backup.timer",        "service": "my-backup.service" }
   ],
   "services": ["nginx", "ssh"],
+  "security": { "tool": "debsecan" },
   "backups": { "dir": "/var/backups/mine", "pattern": "*.tar.gz", "keep": 8 },
   "send": { "local": true }
 }

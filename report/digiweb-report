@@ -212,6 +212,111 @@ def backups(cfg):
     return {"keep": cfg.get("keep"), "files": files}
 
 
+# ---- security --------------------------------------------------------------------------------
+# Only packages installed on this machine are checked, against the distribution's own security data:
+#   debsecan (Debian, Raspberry Pi OS)  install with: sudo apt install --no-install-recommends debsecan
+#                                       (without the flag it also installs a mail server)
+#   pro security-status (Ubuntu, built in)
+# Sends: fixes waiting (security updates released but not installed), urgent open problems (high
+# urgency or remotely exploitable, no fix yet), and CVEs new since the last report.
+
+STATE_DIR = "/var/lib/digiweb-report"
+NOISE_PACKAGES = {"linux-libc-dev"}     # kernel headers: carry every kernel CVE but never run
+MAX_LIST = 20
+
+
+def codename():
+    m = re.search(r"^VERSION_CODENAME=(\S+)", read("/etc/os-release"), re.M)
+    return m.group(1).strip('"') if m else None
+
+
+def new_since_last(ids_by_pkg):
+    """CVE ids not seen in the last report (kept in STATE_DIR). The first run only records the
+    list, so a fresh install doesn't call thousands of old CVEs new."""
+    path = os.path.join(STATE_DIR, "cves.txt")
+    current = set(ids_by_pkg)
+    try:
+        with open(path, encoding="utf-8") as f:
+            seen = set(f.read().split())
+        first = False
+    except OSError:
+        seen, first = set(), True
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            f.write("\n".join(sorted(current)))
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+    if first:
+        return None
+    return sorted(current - seen)
+
+
+def security_debsecan():
+    suite = codename()
+    if not suite:
+        return {"tool": "debsecan", "error": "unknown release"}
+    code, out = run(["debsecan", "--suite", suite, "--format", "summary"], timeout=300)
+    if code != 0 or not out.strip():
+        return {"tool": "debsecan", "error": "debsecan failed (exit %s)" % code}
+    ids_by_pkg, urgent = {}, []
+    for line in out.splitlines():
+        m = re.match(r"(CVE-\d+-\d+|TEMP-\S+)\s+(\S+)(?:\s+\((.*)\))?", line.strip())
+        if not m:
+            continue
+        cve, pkg, notes = m.group(1), m.group(2), (m.group(3) or "").lower()
+        ids_by_pkg.setdefault(cve, set()).add(pkg)
+        if pkg not in NOISE_PACKAGES and ("high urgency" in notes or "remotely exploitable" in notes):
+            urgent.append({"cve": cve, "pkg": pkg, "notes": notes})
+    code, fixed = run(["debsecan", "--suite", suite, "--format", "packages", "--only-fixed"], timeout=300)
+    fixes = sorted(set(fixed.split())) if code == 0 else []
+    # "new" leaves out CVEs that only touch the kernel headers (a handful every day, never run)
+    counted = {c: p for c, p in ids_by_pkg.items() if p - NOISE_PACKAGES}
+    new = new_since_last(counted)
+    return {
+        "tool": "debsecan",
+        "link": "https://security-tracker.debian.org/tracker/",
+        "open_total": len(ids_by_pkg),
+        "fixes_waiting": fixes,
+        "urgent": urgent[:MAX_LIST],
+        "urgent_count": len(urgent),
+        "new": None if new is None else [{"cve": c, "pkgs": sorted(counted[c])} for c in new[:MAX_LIST]],
+        "new_count": None if new is None else len(new),
+    }
+
+
+def security_pro():
+    code, out = run(["pro", "security-status", "--format", "json"], timeout=120)
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return {"tool": "pro", "error": "pro security-status failed (exit %s)" % code}
+    fixes, esm = set(), set()
+    for p in data.get("packages", []):
+        service, status = p.get("service_name", ""), p.get("status", "")
+        if status == "upgrade_available" and service in ("standard-security", "esm-infra", "esm-apps"):
+            fixes.add(p.get("package", "?"))
+        elif status in ("pending_attach", "pending_enable"):
+            esm.add(p.get("package", "?"))
+    return {
+        "tool": "pro",
+        "link": "https://ubuntu.com/security/",
+        "fixes_waiting": sorted(fixes),
+        "esm_only": sorted(esm),       # fixes that need Ubuntu Pro (free for personal use) to install
+    }
+
+
+def security(cfg):
+    tool = (cfg or {}).get("tool")
+    if not tool:
+        return None
+    try:
+        return security_debsecan() if tool == "debsecan" else security_pro() if tool == "pro" else None
+    except Exception as exc:      # a scanner problem must never stop the report
+        return {"tool": tool, "error": str(exc)[:200]}
+
+
 # ---- the report -------------------------------------------------------------------------------
 
 def gather(cfg):
@@ -235,6 +340,7 @@ def gather(cfg):
         "memory": memory(),
         "temperature": temperature(),
         "backups": backups(cfg.get("backups")),
+        "security": security(cfg.get("security")),
     }
 
 

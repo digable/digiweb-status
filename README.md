@@ -27,10 +27,13 @@ one HTML file that rebuilds itself.
 - **Scheduled jobs**: last run, result and next run of each machine's update and backup jobs.
 - **Backups**: the backup files on the server, with size and date (listed only, not downloadable).
 - **Watch list**: things like a CVE, with the kernel version each machine needs.
+- **Security** (optional): known CVEs in the packages each machine has installed, with fixes
+  waiting, urgent problems that have no fix yet, and anything new since the last report, each
+  linked to its tracker page.
 
 A machine is **watch** when it has updates waiting, needs a reboot, has a failed unit or a
 stopped service, a job that ended badly, a disk over 85 %, no backup in 8 days, or fails a watch
-item. It's **down** when it hasn't reported in 48 hours.
+item, or its security scan has fixes waiting or urgent problems. It's **down** when it hasn't reported in 48 hours.
 
 ## Keeping it private
 
@@ -117,6 +120,21 @@ sudo chown status:status /var/lib/digiweb-status/.ssh/authorized_keys && sudo ch
 ```
 
 Back on the machine: `sudo systemctl start digiweb-report`. It prints `received NAME report`.
+
+## Security scan
+
+Add a `security` setting to a machine's `/etc/digiweb-status/report.json`:
+
+- Debian or Raspberry Pi OS: `"security": { "tool": "debsecan" }`, after
+  `sudo apt install --no-install-recommends debsecan` (without that flag apt also installs a mail
+  server). Set `REPORT=false` in `/etc/default/debsecan` so it doesn't try to mail its own report.
+- Ubuntu: `"security": { "tool": "pro" }`. `pro` comes with Ubuntu; nothing to install.
+
+The scan only reads the package list; it changes nothing. Most open CVEs on Debian are low
+priority or not yet rated, so the page shows only what you can act on: fixes waiting (the next
+weekly update installs them), urgent problems (high urgency or remotely exploitable) and CVEs new
+since the last report. The first report only records a starting point, so "new" shows from the
+second one on. `linux-libc-dev` (kernel headers, never the running kernel) is left out.
 
 ## Updating
 
