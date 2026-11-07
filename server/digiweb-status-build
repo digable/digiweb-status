@@ -219,7 +219,7 @@ def card(m, r, state, issues, site, zone, now):
     else:
         rows.append(row("Last update", "none recorded"))
     waiting = r.get("updates_waiting")
-    rows.append(row("Updates waiting", "?" if waiting is None else str(waiting), kind="warn" if waiting else None))
+    rows.append(row("Updates waiting", "?" if waiting is None else e(str(waiting)), kind="warn" if waiting else None))
 
     kernel_note, kernel_kind = "", None
     for w in site.get("watch", []):
@@ -343,6 +343,8 @@ def page(site, reports, now):
         if not sec or sec.get("error"):
             continue
         link = sec.get("link", "")
+        if not (isinstance(link, str) and link.startswith("https://")):
+            link = ""                   # a tracker link, never javascript: or anything else a report makes up
         def cve(c):
             return '<a href="%s%s" rel="noreferrer">%s</a>' % (e(link), e(c), e(c)) if link else e(c)
         for pkg in sec.get("fixes_waiting") or []:
