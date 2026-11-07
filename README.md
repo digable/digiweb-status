@@ -46,7 +46,10 @@ item, or its security scan has fixes waiting or urgent problems. It's **down** w
   login.
 - **Machines can only drop off a report.** Each machine's SSH key is locked to
   `digiweb-status-receive` with that machine's name, so a key can't open a shell, read anything,
-  or pretend to be another machine. Reports are checked (JSON, under 256 KB, known machine).
+  or pretend to be another machine. Reports are checked (JSON, under 256 KB, known machine, and
+  every field the page uses has the right type). A report that doesn't fit is refused, and the
+  machine's report job fails saying which fields; the page keeps that machine's last good report,
+  so one broken report can't stop the page being rebuilt for the others.
 - **The reporter only reads.** os-release, uname, `/proc`, apt's log and `apt-get -s` (a dry run),
   systemctl, and the size and date of backup files. It never reads their contents.
 

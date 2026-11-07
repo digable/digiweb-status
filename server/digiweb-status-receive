@@ -23,6 +23,57 @@ def fail(msg):
     sys.exit("digiweb-status-receive: " + msg)
 
 
+# ---- the report's shape -------------------------------------------------------------------------
+# Every field digiweb-status-build reads, with the type it needs. A report that doesn't fit is refused
+# (the machine's report job fails and says why), so one bad report can't stop the page being rebuilt
+# for every machine; the last good report from that machine stays until a good one arrives.
+# Fields not listed here are kept and ignored. None is allowed wherever the reporter can send it.
+
+def num(lo=None, hi=None):
+    def ok(v):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v in (float("inf"), float("-inf")):
+            return False
+        return (lo is None or v >= lo) and (hi is None or v <= hi)
+    return ok
+
+TIME = num(0, 2 ** 33)            # seconds since 1970: up to the year 2242, so date maths can't overflow
+COUNT = num(0, 10 ** 15)
+STR = lambda v: isinstance(v, str)
+BOOL = lambda v: isinstance(v, bool)
+INT = lambda v: isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 10 ** 9
+
+def opt(t):
+    return lambda v: v is None or check(t, v)
+
+def check(t, v):
+    """True when v fits t: a test function, {key: type} for an object, or [type] for a list of them."""
+    if isinstance(t, dict):
+        return isinstance(v, dict) and all(check(kt, v.get(k)) for k, kt in t.items())
+    if isinstance(t, list):
+        return isinstance(v, list) and all(check(t[0], x) for x in v)
+    return t(v)
+
+SHAPE = {
+    "os": opt(STR), "arch": opt(STR), "kernel": opt(STR), "kernel_upstream": opt(STR),
+    "reported_at": opt(TIME), "booted_at": opt(TIME), "reboot_required": opt(BOOL), "updates_waiting": opt(INT),
+    "last_upgrade": opt({"start_ts": opt(TIME), "upgraded": INT, "installed": INT, "error": opt(BOOL)}),
+    "jobs": opt([{"label": STR, "last_run": opt(TIME), "next_run": opt(TIME), "result": opt(STR), "running": opt(BOOL)}]),
+    "services": opt(lambda v: isinstance(v, dict) and all(isinstance(k, str) and isinstance(x, str) for k, x in v.items())),
+    "failed_units": opt([STR]),
+    "disk": opt({"total": COUNT, "used": COUNT}),
+    "memory": opt({"total": COUNT, "used": COUNT}),
+    "temperature": opt(num(-100, 200)),
+    "backups": opt({"keep": opt(INT), "files": [{"name": STR, "size": COUNT, "time": TIME}]}),
+    "security": opt({"error": opt(STR), "link": opt(STR), "open_total": opt(INT), "fixes_waiting": opt([STR]),
+                     "urgent": opt([{"cve": STR, "pkg": STR, "notes": STR}]), "urgent_count": opt(INT),
+                     "new": opt([{"cve": STR, "pkgs": [STR]}]), "new_count": opt(INT), "esm_only": opt([STR])}),
+}
+
+def bad_fields(report):
+    """The names of the top-level fields that don't fit SHAPE (empty when the report is fine)."""
+    return [k for k, t in SHAPE.items() if not check(t, report.get(k))]
+
+
 def main():
     if len(sys.argv) != 2 or not re.fullmatch(r"[a-z0-9-]{1,32}", sys.argv[1]):
         fail("usage: digiweb-status-receive NAME")
@@ -36,11 +87,14 @@ def main():
     if len(raw) > MAX_BYTES:
         fail("report too large")
     try:
-        report = json.loads(raw.decode("utf-8"))
+        report = json.loads(raw.decode("utf-8"), parse_constant=lambda c: fail("report has " + c))   # no NaN or Infinity
     except (UnicodeDecodeError, ValueError):
         fail("report isn't JSON")
     if not isinstance(report, dict) or report.get("version") != 1:
         fail("unexpected report format")
+    wrong = bad_fields(report)
+    if wrong:
+        fail("report refused, these fields aren't the right type: " + ", ".join(wrong))
 
     report["machine"] = name                 # the key decides who this is
     report["received_at"] = int(time.time())
